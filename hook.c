@@ -12,20 +12,60 @@
 //
 //#define printf(...) fprintf(_stdout, __VA_ARGS__), fflush(_stdout)
 
+#define GetCurrentProcess() ((HANDLE)-1)
+
 int vsprintf(char *, const char *, va_list);
 static CRITICAL_SECTION printf_lock;
 static HANDLE hStdout;
+
+NTSYSCALLAPI NTSTATUS NtAllocateVirtualMemory(
+	HANDLE    ProcessHandle,
+	PVOID     *BaseAddress,
+	ULONG_PTR ZeroBits,
+	PSIZE_T   RegionSize,
+	ULONG     AllocationType,
+	ULONG     Protect
+);
+
+NTSYSCALLAPI NTSTATUS NtProtectVirtualMemory(
+	HANDLE ProcessHandle,
+	PVOID *BaseAddress,
+	SIZE_T *NumberOfBytesToProtect,
+	ULONG NewAccessProtection,
+	PULONG OldAccessProtection
+);
+
+NTSYSCALLAPI NTSTATUS NtWriteFile(
+	HANDLE FileHandle,
+	HANDLE Event,
+	PIO_APC_ROUTINE ApcRoutine,
+	PVOID ApcContext,
+	PIO_STATUS_BLOCK IoStatusBlock,
+	PVOID Buffer,
+	ULONG Length,
+	PLARGE_INTEGER ByteOffset,
+	PULONG Key
+);
+
+NTSTATUS NTAPI LdrGetProcedureAddress(PVOID BaseAddress, PANSI_STRING Name, ULONG Ordinal, PVOID *ProcedureAddress);
+NTSTATUS NTAPI LdrDisableThreadCalloutsForDll (PVOID BaseAddress);
+
+NTSTATUS NTAPI RtlInitializeCriticalSection(PCRITICAL_SECTION);
+NTSTATUS NTAPI RtlEnterCriticalSection(PCRITICAL_SECTION);
+NTSTATUS NTAPI RtlLeaveCriticalSection(PCRITICAL_SECTION);
 
 int printf(const char *fmt, ...) {
 	static char buf[4096];
 
 	va_list args;
 	va_start(args, fmt);
-	EnterCriticalSection(&printf_lock);
+	RtlEnterCriticalSection(&printf_lock);
 	int r = vsprintf(buf, fmt, args);
-	DWORD w = 0;
-	WriteConsoleA(hStdout, buf, r, &w, NULL);
-	LeaveCriticalSection(&printf_lock);
+	IO_STATUS_BLOCK IoStatusBlock = {};
+	NtWriteFile(hStdout, NULL, NULL, NULL, &IoStatusBlock, buf, r, NULL, NULL);
+	//DWORD w = 0;
+	//WriteConsoleA(hStdout, buf, r, &w, NULL);
+	RtlLeaveCriticalSection(&printf_lock);
 	va_end(args);
 	return r;
 }
@@ -161,18 +201,64 @@ BOOL create_hook(FARPROC addr, LPVOID target, LPVOID *copy) {
 		RtlCopyMemory(*copy, addr, 0x40);
 	}
 
-	SIZE_T w = 0;
-	if (!WriteProcessMemory(GetCurrentProcess(), addr, hook, sizeof(hook), &w) || w != sizeof(hook)) {
-		MessageBoxW(NULL, L"WPM failed", L"ERROR", MB_ICONERROR);
+	PVOID Base = addr;
+	SIZE_T ProtSize = 16;
+	ULONG OldProt;
+
+	if (!NT_SUCCESS(NtProtectVirtualMemory(GetCurrentProcess(), &Base, &ProtSize, PAGE_EXECUTE_READWRITE, &OldProt))) {
+		MessageBoxW(NULL, L"NtProtectVirtualMemory failed", L"ERROR", MB_ICONERROR);
+		return FALSE;
+	}
+
+	RtlCopyMemory(addr, hook, sizeof(hook));
+
+	if (!NT_SUCCESS(NtProtectVirtualMemory(GetCurrentProcess(), &Base, &ProtSize, OldProt, &OldProt))) {
+		MessageBoxW(NULL, L"NtProtectVirtualMemory failed", L"ERROR", MB_ICONERROR);
 		return FALSE;
 	}
 
 	return TRUE;
 }
 
+FARPROC GetProcAddress(HMODULE dll, LPCSTR name) {
+	ANSI_STRING ansi_name;
+	RtlInitAnsiString(&ansi_name, name);
+	FARPROC r = NULL;
+	NTSTATUS Status = LdrGetProcedureAddress(dll, &ansi_name, (WORD)0, (PVOID*)&r);
+	if (NT_ERROR(Status)) {
+		MessageBoxW(NULL, L"LdrGetProcedureAddress failed", L"ERROR", MB_ICONERROR);
+		return NULL;
+	}
+	return r;
+}
+
 BOOL install_hook() {
-	_stub = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	HMODULE ntdll = GetModuleHandleW(L"ntdll");
+	SIZE_T RegionSize = 0x1000;
+	NTSTATUS status = NtAllocateVirtualMemory(GetCurrentProcess(), (PVOID*)&_stub, 0, &RegionSize, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!NT_SUCCESS(status)) {
+		MessageBoxW(NULL, L"NtAllocateVirtualMemory failed", L"ERROR", MB_ICONERROR);
+		return FALSE;
+	}
+	// _stub = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	HMODULE ntdll = NULL;
+
+	PPEB_LDR_DATA ldr = NtCurrentTeb()->ProcessEnvironmentBlock->Ldr;
+	LIST_ENTRY *head = &ldr->InMemoryOrderModuleList;
+	for (LIST_ENTRY *node = head->Flink; node != head; node = node->Flink) {
+		PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(node, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+		PUNICODE_STRING BaseDllName = &entry->FullDllName + 1;
+
+		if (_wcsicmp(BaseDllName->Buffer, L"ntdll.dll") == 0) {
+			ntdll = entry->DllBase;
+		}
+	}
+
+	if (ntdll == NULL) {
+		MessageBoxW(NULL, L"Can not find NTDLL", L"ERROR", MB_ICONERROR);
+		return FALSE;
+	}
+
 	if (!create_hook(GetProcAddress(ntdll, "NtOpenFile"), hook_NtOpenFile, (LPVOID*)&my_NtOpenFile)) {
 		MessageBoxW(NULL, L"Can not hook NtOpenFile", L"ERROR", MB_ICONERROR);
 		return FALSE;
@@ -227,14 +313,25 @@ BOOL peb_ldr_unlink(HMODULE mod) {
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 	if (fdwReason == DLL_PROCESS_ATTACH) {
-		DisableThreadLibraryCalls(hinstDLL);
+		LdrDisableThreadCalloutsForDll(hinstDLL);
 
 		AllocConsole();
 
 		// use kernel32 and ntdll
 
-		InitializeCriticalSection(&printf_lock);
-		hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+		RtlInitializeCriticalSection(&printf_lock);
+		struct _PARTIAL_RTL_USER_PROCESS_PARAMETERS {
+			ULONG MaximumLength;
+			ULONG Length;
+			ULONG Flags;
+			ULONG DebugFlags;
+			PVOID ConsoleHandle;
+			ULONG ConsoleFlags;
+			HANDLE StandardInput;
+			HANDLE StandardOutput;
+			HANDLE StandardError;
+		} *UserProcessParameters = (PVOID)NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters;
+		hStdout = UserProcessParameters->StandardOutput;
 
 		// use msvcrt
 
